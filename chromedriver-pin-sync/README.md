@@ -1,8 +1,10 @@
 # chromedriver-pin-sync
 
-A **single-file, fully offline** utility that reconciles the ChromeDriver
-version pinned in a repository with the ChromeDriver version installed on the
-machine you run it from.
+A **single-file, fully offline** PowerShell utility that reconciles the
+ChromeDriver version pinned in a repository with the ChromeDriver version
+installed on the machine you run it from. Built for **Windows Server 2022**
+(Windows PowerShell 5.1, which ships in the box) and also runs on
+PowerShell 7+.
 
 It does four things, in order:
 
@@ -12,61 +14,67 @@ It does four things, in order:
    `.tool-versions`, YAML, `.env`, and more).
 3. **Shows you the diff** between what's pinned and what you have installed.
 4. **Updates** the pins — but only the ones that are *behind* your installed
-   driver — when you pass `--apply`.
+   driver — when you pass `-Apply`.
 
 ## Hard guarantees
 
-- **No network. No API calls. No back-end.** The only subprocess it ever runs
-  is a local Chrome/ChromeDriver binary with `--version` to read its own
+- **No network. No API calls. No back-end.** The only external process it ever
+  runs is a local Chrome/ChromeDriver binary with `--version` to read its own
   version banner. Nothing leaves the host. Safe on air-gapped / network-
-  separated systems.
-- **Pure Python 3 standard library.** No `pip install`, no third-party deps.
-- **One file** — `chromedriver_pin_sync.py`. Copy the folder anywhere and run.
-- Targets **Linux (Red Hat family: RHEL / CentOS / Fedora)** and works on
-  generic Linux and macOS layouts too.
+  separated systems (or pass `-Version` to skip execution entirely).
+- **In-box PowerShell.** Windows PowerShell 5.1 on Windows Server 2022, no
+  modules to install. Runs on PowerShell 7+ too.
+- **One file** — `chromedriver_pin_sync.ps1`. Copy the folder anywhere and run.
 
 ## Requirements
 
-- Python 3.6+ (standard library only).
+- Windows Server 2022 (or Windows 10/11), Windows PowerShell 5.1+ — no
+  additional modules.
 
 ## Usage
 
-```bash
+```powershell
 # 1) Dry run — detect + scan + show the diff, change nothing (default).
-./chromedriver_pin_sync.py --repo /path/to/your/checkout
+.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp
 
 # 2) Same, but actually WRITE the upgrades (only where installed > pinned).
-./chromedriver_pin_sync.py --repo /path/to/your/checkout --apply
+.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -Apply
 
 # 3) Air-gapped box where the driver binary can't be executed?
 #    Supply the installed version by hand:
-./chromedriver_pin_sync.py --repo /path/to/checkout --version 128.0.6613.119
+.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -Version 128.0.6613.119
 
 # 4) Point at a specific driver binary:
-./chromedriver_pin_sync.py --repo /path/to/checkout \
-    --chromedriver /opt/selenium/chromedriver
+.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -ChromeDriver "C:\Selenium\chromedriver.exe"
 ```
 
-### Options
+If script execution is blocked by policy, run it for the current process only:
 
-| Flag | Meaning |
-|------|---------|
-| `--repo`, `-r` | **(required)** Repository / checkout to scan. |
-| `--version`, `-V` | Installed ChromeDriver version to use, e.g. `128.0.6613.119`. Use on air-gapped hosts. |
-| `--chromedriver`, `-c` | Explicit path to the `chromedriver` binary to interrogate. |
-| `--apply` | Write the upgrades to disk. Without it, the run is a dry run. |
-| `--quiet`, `-q` | Suppress the "already current" / "ahead" detail. |
+```powershell
+powershell -ExecutionPolicy Bypass -File .\chromedriver_pin_sync.ps1 -Repo C:\code\myapp
+```
+
+### Parameters
+
+| Parameter | Meaning |
+|-----------|---------|
+| `-Repo`, `-r` | **(required)** Repository / checkout to scan. |
+| `-Version`, `-V` | Installed ChromeDriver version to use, e.g. `128.0.6613.119`. Use on air-gapped hosts. |
+| `-ChromeDriver`, `-c` | Explicit path to the `chromedriver.exe` binary to interrogate. |
+| `-Apply` | Write the upgrades to disk. Without it, the run is a dry run. |
+| `-Quiet`, `-q` | Suppress the "already current" / "ahead" detail. |
 
 ## How version detection works (offline)
 
 Resolution order, first hit wins:
 
-1. `--version` you supplied.
-2. `--chromedriver <path>` you supplied.
-3. `chromedriver` on `PATH`.
-4. Well-known driver locations (`/usr/bin`, `/usr/local/bin`,
-   `/opt/...`, etc.).
-5. Fallback: the installed Google Chrome / Chromium version — ChromeDriver's
+1. `-Version` you supplied.
+2. `-ChromeDriver <path>` you supplied.
+3. `chromedriver.exe` on `PATH`.
+4. Well-known driver locations (`Program Files`, `C:\chromedriver`,
+   `C:\Selenium`, Chocolatey `bin`, etc.).
+5. Fallback: the installed Google Chrome / Chromium version — read from the
+   executable's file version, or from the registry (`BLBeacon`). ChromeDriver's
    version tracks the browser, so the major line matches.
 
 ## Update rules
@@ -79,6 +87,8 @@ Resolution order, first hit wins:
   → `147.0.7727.24.0`) is preserved.
 - Pins that are **equal to** or **ahead of** your installed driver are never
   touched (and the "ahead" ones are reported so you can see them).
+- Original line endings (CRLF/LF) and trailing-newline state are preserved on
+  write.
 
 ## Exit codes
 
@@ -91,8 +101,8 @@ Resolution order, first hit wins:
 ## What gets scanned
 
 Config/manifest/CI files by extension (`.txt`, `.yml`, `.yaml`, `.json`,
-`.toml`, `.env`, `.sh`, `.cfg`, `.ini`, `.gradle`, `.tf`, …) and by name
-(`Dockerfile`, `Makefile`, `.tool-versions`, `requirements.txt`,
+`.toml`, `.env`, `.ps1`, `.bat`, `.cmd`, `.cfg`, `.ini`, `.gradle`, `.tf`, …)
+and by name (`Dockerfile`, `Makefile`, `.tool-versions`, `requirements.txt`,
 `package.json`, `docker-compose.yml`, …). VCS and dependency directories
 (`.git`, `node_modules`, `.venv`, `dist`, `build`, …) are skipped.
 
