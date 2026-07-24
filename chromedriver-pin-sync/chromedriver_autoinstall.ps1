@@ -30,10 +30,28 @@ Add-Type -Namespace Win32 -Name Net -MemberDefinition @'
 public static extern int URLDownloadToFile(System.IntPtr pCaller, string szURL, string szFileName, int dwReserved, System.IntPtr lpfnCB);
 '@ -ErrorAction SilentlyContinue
 
+# Returns the HRESULT from urlmon (0 = success). Does not throw.
 function Get-File([string] $Url, [string] $OutFile) {
     if (Test-Path -LiteralPath $OutFile) { Remove-Item -LiteralPath $OutFile -Force }
-    $hr = [Win32.Net]::URLDownloadToFile([IntPtr]::Zero, $Url, $OutFile, 0, [IntPtr]::Zero)
-    if ($hr -ne 0) { throw ("download failed for {0} (HRESULT 0x{1:X8})" -f $Url, $hr) }
+    return [Win32.Net]::URLDownloadToFile([IntPtr]::Zero, $Url, $OutFile, 0, [IntPtr]::Zero)
+}
+
+# Human text for the common WinINet/urlmon HRESULTs (egress diagnosis).
+# NB: 0x8xxxxxxx HRESULTs are negative Int32 in PowerShell -- compare/format
+# them as-is; do NOT cast to [uint32] (a checked cast throws on negatives).
+function Format-Hr([int] $Hr) {
+    switch ($Hr) {
+        0x80072EE7 { 'name not resolved (DNS) -- host unreachable' ; break }
+        0x80072EFD { 'cannot connect -- egress blocked/firewalled' ; break }
+        0x80072EE2 { 'timed out -- no route to host' ; break }
+        0x80072F0C { 'proxy authentication required (407)' ; break }
+        0x800C0005 { 'resource/server not found' ; break }
+        0x800C0006 { 'object not found (HTTP 404)' ; break }
+        0x800C0008 { 'download failure' ; break }
+        0x800C000D { 'unknown protocol' ; break }
+        0x80092013 { 'revocation check failed (offline CRL) -- TLS' ; break }
+        default    { ('HRESULT 0x{0:X8}' -f $Hr) }
+    }
 }
 
 # --- 1. installed Chrome version -------------------------------------------
@@ -65,19 +83,41 @@ $parts = $chromeVer -split '\.'
 $build = "$($parts[0]).$($parts[1]).$($parts[2])"
 $tmp = [System.IO.Path]::GetTempFileName()
 $driverVer = $null
+$diag = @()
 foreach ($u in "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_$build",
                "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_$($parts[0])") {
-    try { Get-File $u $tmp; $v = ([System.IO.File]::ReadAllText($tmp)).Trim() } catch { $v = $null }
-    if ($v -and ($v -match '^\d+(\.\d+){3}$')) { $driverVer = $v; break }
+    $hr = Get-File $u $tmp
+    if ($hr -ne 0) {
+        $diag += ("  {0}`n      -> {1}" -f $u, (Format-Hr $hr))
+        continue
+    }
+    $v = ([System.IO.File]::ReadAllText($tmp)).Trim()
+    if ($v -match '^\d+(\.\d+){3}$') { $driverVer = $v; break }
+    $snip = $v -replace '\s+', ' '
+    if ($snip.Length -gt 80) { $snip = $snip.Substring(0, 80) + '...' }
+    $diag += ("  {0}`n      -> reachable but returned non-version content: '{1}'" -f $u, $snip)
 }
 Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-if (-not $driverVer) { throw "could not resolve a ChromeDriver version for Chrome $chromeVer" }
+if (-not $driverVer) {
+    Write-Host ''
+    Write-Host "ERROR: could not resolve a ChromeDriver version for Chrome $chromeVer." -ForegroundColor Red
+    $diag | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+    Write-Host ''
+    Write-Host 'If the errors above are DNS/connect/timeout/proxy, this host cannot reach' -ForegroundColor Yellow
+    Write-Host 'googlechromelabs.github.io (URLDownloadToFile uses WinINet/IE proxy settings,' -ForegroundColor Yellow
+    Write-Host 'which a service/non-interactive session may not have). Download' -ForegroundColor Yellow
+    Write-Host "chromedriver-win64.zip for $build on a reachable box and unzip it to" -ForegroundColor Yellow
+    Write-Host "$(Split-Path -Parent $Destination) yourself." -ForegroundColor Yellow
+    exit 1
+}
 Write-Host "ChromeDriver     : $driverVer"
 
 # --- 3. download + install --------------------------------------------------
 $zip = Join-Path $env:TEMP "chromedriver-$driverVer-win64.zip"
 $out = Join-Path $env:TEMP "chromedriver-$driverVer-win64"
-Get-File "https://storage.googleapis.com/chrome-for-testing-public/$driverVer/win64/chromedriver-win64.zip" $zip
+$zipUrl = "https://storage.googleapis.com/chrome-for-testing-public/$driverVer/win64/chromedriver-win64.zip"
+$hr = Get-File $zipUrl $zip
+if ($hr -ne 0) { throw ("download failed: {0} -> {1}" -f $zipUrl, (Format-Hr $hr)) }
 if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force }
 Expand-Archive -LiteralPath $zip -DestinationPath $out -Force
 
