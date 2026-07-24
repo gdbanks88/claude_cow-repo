@@ -1,113 +1,153 @@
 # chromedriver-pin-sync
 
-A **single-file, fully offline** PowerShell utility that reconciles the
-ChromeDriver version pinned in a repository with the ChromeDriver version
-installed on the machine you run it from. Built for **Windows Server 2022**
-(Windows PowerShell 5.1, which ships in the box) and also runs on
-PowerShell 7+.
+PowerShell tooling for **Windows Server 2022** (Windows PowerShell 5.1, in-box;
+also runs on PowerShell 7+) to keep ChromeDriver, Chrome, and your repo's
+pinned version in agreement — and to fix the classic mismatch:
 
-It does four things, in order:
+```
+SessionNotCreatedException: This version of ChromeDriver only supports Chrome
+version 148 / Current browser version is 150.0.7871.129
+```
 
-1. **Detects** the ChromeDriver version installed locally.
-2. **Scans** a repository you choose for every place the ChromeDriver version
-   is *pinned* (CI files, Dockerfiles, `requirements.txt`, `package.json`,
-   `.tool-versions`, YAML, `.env`, and more).
-3. **Shows you the diff** between what's pinned and what you have installed.
-4. **Updates** the pins — but only the ones that are *behind* your installed
-   driver — when you pass `-Apply`.
+There are **two scripts**, with deliberately different network postures:
 
-## Hard guarantees
+| Script | Network | Job |
+|--------|---------|-----|
+| `chromedriver_pin_sync.ps1` | **None (offline)** | Detect installed driver **and** browser, warn on major mismatch, and update the ChromeDriver version pinned in a repo. |
+| `chromedriver_autoinstall.ps1` | **Online** | Resolve the ChromeDriver that matches your installed Chrome and install it locally, downloading via a native Windows API. |
 
-- **No network. No API calls. No back-end.** The only external process it ever
-  runs is a local Chrome/ChromeDriver binary with `--version` to read its own
-  version banner. Nothing leaves the host. Safe on air-gapped / network-
-  separated systems (or pass `-Version` to skip execution entirely).
-- **In-box PowerShell.** Windows PowerShell 5.1 on Windows Server 2022, no
-  modules to install. Runs on PowerShell 7+ too.
-- **One file** — `chromedriver_pin_sync.ps1`. Copy the folder anywhere and run.
+---
 
-## Requirements
+## 1. `chromedriver_pin_sync.ps1` — offline pin auditor/updater
 
-- Windows Server 2022 (or Windows 10/11), Windows PowerShell 5.1+ — no
-  additional modules.
+Fully offline. The only OS interaction is spawning the local driver/Chrome
+binary to read its `--version`; use `-Version` to avoid even that. No network,
+no API calls.
 
-## Usage
+It:
+
+1. Detects the installed **ChromeDriver** (binary `--version`) **and** the
+   installed **Chrome** (executable file-version or `BLBeacon` registry key).
+2. **Warns** when their major versions differ — the exact cause of the Selenium
+   `SessionNotCreatedException` above.
+3. Scans a repo you choose for every place the ChromeDriver version is *pinned*
+   (CI files, Dockerfiles, `requirements.txt`, `package.json`, `.tool-versions`,
+   YAML, `.env`, …).
+4. Shows a **diff**, and with `-Apply` updates the pins that are *behind* the
+   version being synced.
+
+### Usage
 
 ```powershell
-# 1) Dry run — detect + scan + show the diff, change nothing (default).
+# Dry run: detect both, warn on mismatch, show the diff. Changes nothing.
 .\chromedriver_pin_sync.ps1 -Repo C:\code\myapp
 
-# 2) Same, but actually WRITE the upgrades (only where installed > pinned).
+# Write the pin updates.
 .\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -Apply
 
-# 3) Air-gapped box where the driver binary can't be executed?
-#    Supply the installed version by hand:
-.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -Version 128.0.6613.119
-
-# 4) Point at a specific driver binary:
-.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -ChromeDriver "C:\Selenium\chromedriver.exe"
+# Air-gapped: supply the version, no binary is executed.
+.\chromedriver_pin_sync.ps1 -Repo C:\code\myapp -Version 150.0.7871.120
 ```
 
-If script execution is blocked by policy, run it for the current process only:
+### Which version drives the pin? (`-Source`)
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\chromedriver_pin_sync.ps1 -Repo C:\code\myapp
-```
+When the installed driver and browser differ, `-Source` decides what the repo
+is pinned to:
+
+| `-Source` | Pins to |
+|-----------|---------|
+| `Auto` *(default)* | The **Chrome browser** version — that *is* the ChromeDriver version you need — falling back to the driver if no browser is found. |
+| `Browser` | Always the Chrome browser version. |
+| `Driver` | Always the installed ChromeDriver version. |
+| `Newer` | The higher of the two. |
+
+> Given the mismatch error, `Auto` intentionally pins to **Chrome's** version so
+> provisioning/CI fetches a *matching* driver — not the stale driver you happen
+> to have on disk.
 
 ### Parameters
 
 | Parameter | Meaning |
 |-----------|---------|
 | `-Repo`, `-r` | **(required)** Repository / checkout to scan. |
-| `-Version`, `-V` | Installed ChromeDriver version to use, e.g. `128.0.6613.119`. Use on air-gapped hosts. |
-| `-ChromeDriver`, `-c` | Explicit path to the `chromedriver.exe` binary to interrogate. |
-| `-Apply` | Write the upgrades to disk. Without it, the run is a dry run. |
+| `-Version`, `-V` | Version to sync to; skips detection (air-gapped). |
+| `-ChromeDriver`, `-c` | Explicit path to `chromedriver.exe`. |
+| `-Source`, `-s` | `Auto` / `Browser` / `Driver` / `Newer` (see above). |
+| `-Apply` | Write the updates. Without it, dry run. |
 | `-Quiet`, `-q` | Suppress the "already current" / "ahead" detail. |
 
-## How version detection works (offline)
+Exit codes: `0` clean, `1` error, `2` dry-run found upgrades ("repo is behind",
+useful for CI gating). Update rules honor each pin's granularity, preserve pip
+packaging suffixes, and preserve CRLF/LF + trailing-newline on write.
 
-Resolution order, first hit wins:
+---
 
-1. `-Version` you supplied.
-2. `-ChromeDriver <path>` you supplied.
-3. `chromedriver.exe` on `PATH`.
-4. Well-known driver locations (`Program Files`, `C:\chromedriver`,
-   `C:\Selenium`, Chocolatey `bin`, etc.).
-5. Fallback: the installed Google Chrome / Chromium version — read from the
-   executable's file version, or from the registry (`BLBeacon`). ChromeDriver's
-   version tracks the browser, so the major line matches.
+## 2. `chromedriver_autoinstall.ps1` — resolve + install a matching driver
 
-## Update rules
+This is the **online** companion. Its whole job is: find the correct
+ChromeDriver for the Chrome you have, and install it locally. It does **not**
+touch any repo, tests, or Chrome itself.
 
-- A pin is upgraded **only** when your installed driver is a *higher* version.
-- Comparison honors the pin's own **granularity**: a major-only pin like
-  `114` moves only when the major changes (→ `147`); a full pin like
-  `114.0.5735.90` moves on any component (→ `147.0.7727.24`).
-- A packaging suffix on a pip pin (e.g. `chromedriver-binary==114.0.5735.90.0`
-  → `147.0.7727.24.0`) is preserved.
-- Pins that are **equal to** or **ahead of** your installed driver are never
-  touched (and the "ahead" ones are reported so you can see them).
-- Original line endings (CRLF/LF) and trailing-newline state are preserved on
-  write.
+Version resolution follows Google's documented lookup for a non-CfT Chrome
+binary: take Chrome's `MAJOR.MINOR.BUILD` and query the Chrome-for-Testing
+"latest patch per build" endpoint, falling back to the milestone endpoint:
 
-## Exit codes
+```
+https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_<MAJOR.MINOR.BUILD>
+https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_<MAJOR>   (fallback)
+```
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success — nothing to do, or changes shown/applied cleanly. |
-| `1` | Usage / environment error (bad repo path, version undetectable, …). |
-| `2` | Dry run found upgrades that were **not** written. Useful for CI gating: `2` == "the repo is behind". |
+The download uses a **native Windows API — `urlmon!URLDownloadToFile`** (WinINet
+under the hood, honoring the system/WinHTTP proxy and SChannel TLS) via
+P/Invoke, not `Invoke-WebRequest`.
 
-## What gets scanned
+### Usage
 
-Config/manifest/CI files by extension (`.txt`, `.yml`, `.yaml`, `.json`,
-`.toml`, `.env`, `.ps1`, `.bat`, `.cmd`, `.cfg`, `.ini`, `.gradle`, `.tf`, …)
-and by name (`Dockerfile`, `Makefile`, `.tool-versions`, `requirements.txt`,
-`package.json`, `docker-compose.yml`, …). VCS and dependency directories
-(`.git`, `node_modules`, `.venv`, `dist`, `build`, …) are skipped.
+```powershell
+# Detect Chrome, resolve + download the matching driver, install it.
+# (Run elevated when writing under C:\ .)
+.\chromedriver_autoinstall.ps1
 
-A version counts as a ChromeDriver pin only when a `chromedriver` token (any
-of `chromedriver` / `chrome-driver` / `chrome_driver` / `CHROMEDRIVER`) is
-directly associated with it — on the same line, or as the key above a nested
-`version:` value. Neighboring unrelated pins (e.g. `requests==2.31.0`) are
-left alone.
+# Install somewhere else.
+.\chromedriver_autoinstall.ps1 -Destination C:\Selenium\chromedriver.exe
+
+# Force a specific driver version (still downloads).
+.\chromedriver_autoinstall.ps1 -DriverVersion 150.0.7871.120
+
+# Egress blocked? Download chromedriver-win64.zip on a reachable box from
+# https://googlechromelabs.github.io/chrome-for-testing/ and sideload it —
+# fully offline:
+.\chromedriver_autoinstall.ps1 -ZipPath D:\stage\chromedriver-win64.zip
+```
+
+### Parameters
+
+| Parameter | Meaning |
+|-----------|---------|
+| `-Destination`, `-d` | Install path. Default `C:\WebDriver\chromedriver.exe`. |
+| `-ChromePath` | Explicit `chrome.exe`. Default: auto-detect (paths + registry). |
+| `-DriverVersion`, `-V` | Force a driver version and skip the CfT lookup. |
+| `-Platform` | `win64` *(default)* or `win32`. |
+| `-ZipPath` | Install from a pre-downloaded zip; no network. |
+
+Exit codes: `0` success, `1` error. It stops any running `chromedriver` process
+before replacing the binary and verifies with `chromedriver --version` after.
+
+---
+
+## Recommended workflow
+
+1. **Diagnose / prevent:** run `chromedriver_pin_sync.ps1 -Repo <repo>` in CI or
+   pre-suite. The driver-vs-browser mismatch warning (and exit `2` on stale
+   pins) turns a `SessionNotCreatedException` stack into a one-line failure.
+2. **Fix the box:** run `chromedriver_autoinstall.ps1` to drop a matching
+   ChromeDriver next to your Chrome.
+3. **Get off the moving target:** pin a Chrome-for-Testing build and its matched
+   driver as a pair (mirror the zips into your artifact registry for runners) so
+   production Chrome auto-updating can't drift out from under a pinned driver.
+
+## Requirements
+
+- Windows Server 2022 / Windows 10/11, Windows PowerShell 5.1+ — no modules.
+- `chromedriver_autoinstall.ps1` needs outbound HTTPS to
+  `googlechromelabs.github.io` and `storage.googleapis.com` (or use `-ZipPath`).

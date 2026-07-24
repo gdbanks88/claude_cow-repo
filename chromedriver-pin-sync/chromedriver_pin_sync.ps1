@@ -35,6 +35,18 @@
 .PARAMETER ChromeDriver
     Explicit path to the chromedriver.exe binary to interrogate.
 
+.PARAMETER Source
+    Which detected version drives the repo pin update when the installed
+    ChromeDriver and the installed Chrome browser differ:
+      Auto    (default) Chrome browser version if known -- that IS the
+              ChromeDriver version you need for Selenium -- else the driver.
+      Browser Always the Chrome browser version (else the driver).
+      Driver  Always the installed ChromeDriver version (else the browser).
+      Newer   The higher of the two.
+    The tool always reports both and warns when their majors disagree (the
+    cause of Selenium's SessionNotCreatedException). To actually install a
+    matching driver, use the companion script chromedriver_autoinstall.ps1.
+
 .PARAMETER Apply
     Actually write the upgrades to disk. Without it, the run is a dry run that
     only shows the diff.
@@ -73,6 +85,10 @@ param(
 
     [Alias('c')]
     [string] $ChromeDriver,
+
+    [ValidateSet('Auto', 'Browser', 'Driver', 'Newer')]
+    [Alias('s')]
+    [string] $Source = 'Auto',
 
     [switch] $Apply,
 
@@ -247,31 +263,20 @@ function Invoke-VersionBanner {
     return $out
 }
 
-function Get-InstalledDriverVersion {
+function Get-ChromeDriverVersion {
     <#
-        Figure out the locally installed ChromeDriver version, offline.
+        Detect the installed ChromeDriver binary version, offline.
         Priority:
-          1. -Version supplied by the user (air-gapped hosts).
-          2. -ChromeDriver <path> supplied by the user.
-          3. chromedriver(.exe) on PATH.
-          4. Well-known driver locations.
-          5. Fallback: installed Chrome/Chromium version (file or registry).
+          1. -ChromeDriver <path> supplied by the user.
+          2. chromedriver(.exe) on PATH.
+          3. Well-known driver locations.
         Returns a PSCustomObject { Version = int[]; Source; Raw } or $null.
+        (Does NOT fall back to the browser -- that is a separate signal.)
     #>
-    param([string] $ExplicitVersion, [string] $ExplicitBinary)
-
-    # 1) Explicit version wins outright.
-    if (-not [string]::IsNullOrWhiteSpace($ExplicitVersion)) {
-        $v = ConvertTo-VersionArray $ExplicitVersion
-        if ($null -eq $v) {
-            throw "-Version '$ExplicitVersion' is not a valid dotted version (expected e.g. 128.0.6613.119)"
-        }
-        return [pscustomobject]@{ Version = $v; Source = 'provided via -Version'; Raw = $ExplicitVersion }
-    }
+    param([string] $ExplicitBinary)
 
     $candidates = New-Object System.Collections.Generic.List[string]
 
-    # 2) Explicit binary path.
     if (-not [string]::IsNullOrWhiteSpace($ExplicitBinary)) {
         if (-not (Test-Path -LiteralPath $ExplicitBinary -PathType Leaf)) {
             throw "-ChromeDriver path does not exist: $ExplicitBinary"
@@ -279,13 +284,11 @@ function Get-InstalledDriverVersion {
         $candidates.Add($ExplicitBinary)
     }
 
-    # 3) PATH lookup.
     foreach ($name in @('chromedriver.exe', 'chromedriver')) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
         if ($cmd -and $cmd.Source) { $candidates.Add($cmd.Source); break }
     }
 
-    # 4) Well-known locations.
     foreach ($p in $script:CommonDriverPaths) {
         if (Test-Path -LiteralPath $p -PathType Leaf) { $candidates.Add($p) }
     }
@@ -304,7 +307,20 @@ function Get-InstalledDriverVersion {
         }
     }
 
-    # 5a) Fallback: Chrome/Chromium executable file version (no execution).
+    return $null
+}
+
+function Get-ChromeBrowserVersion {
+    <#
+        Detect the installed Google Chrome / Chromium version, offline, WITHOUT
+        launching the browser: read the executable's file version, then fall
+        back to the registry (BLBeacon). This is the ChromeDriver version you
+        actually need, because Selenium requires the driver major to match the
+        browser major.
+        Returns a PSCustomObject { Version = int[]; Source; Raw } or $null.
+    #>
+
+    # a) Chrome/Chromium executable file version (no execution).
     foreach ($p in $script:CommonBrowserPaths) {
         if (Test-Path -LiteralPath $p -PathType Leaf) {
             try {
@@ -315,17 +331,13 @@ function Get-InstalledDriverVersion {
             if ($pv) {
                 $v = Get-FirstVersionArray $pv
                 if ($v) {
-                    return [pscustomobject]@{
-                        Version = $v
-                        Source  = "Chrome/Chromium at $p (driver version tracks the browser)"
-                        Raw     = $pv
-                    }
+                    return [pscustomobject]@{ Version = $v; Source = "Chrome/Chromium at $p"; Raw = $pv }
                 }
             }
         }
     }
 
-    # 5b) Fallback: Chrome version from the registry.
+    # b) Chrome version from the registry.
     foreach ($key in $script:ChromeRegistryKeys) {
         try {
             $item = Get-ItemProperty -Path $key -ErrorAction Stop
@@ -336,15 +348,56 @@ function Get-InstalledDriverVersion {
         if ($rv) {
             $v = Get-FirstVersionArray $rv
             if ($v) {
-                return [pscustomobject]@{
-                    Version = $v
-                    Source  = "Chrome version from registry $key (driver tracks the browser)"
-                    Raw     = $rv
-                }
+                return [pscustomobject]@{ Version = $v; Source = "Chrome registry $key"; Raw = $rv }
             }
         }
     }
 
+    return $null
+}
+
+function New-EffectiveVersion {
+    param($Detection, [string] $Label)
+    return [pscustomobject]@{ Version = $Detection.Version; Source = $Label; Raw = $Detection.Raw }
+}
+
+function Select-EffectiveVersion {
+    <#
+        Decide which detected version drives the repo pin update:
+          Auto    -> Chrome browser version if known (that IS the ChromeDriver
+                     version you need for Selenium); else the driver version.
+          Browser -> Chrome browser version; else the driver version.
+          Driver  -> ChromeDriver version; else the browser version.
+          Newer   -> the higher of the two.
+        Returns { Version; Source; Raw } or $null when neither is available.
+    #>
+    param($Driver, $Browser, [string] $Mode)
+
+    switch ($Mode) {
+        'Driver' {
+            if ($null -ne $Driver)  { return (New-EffectiveVersion $Driver  'installed ChromeDriver') }
+            if ($null -ne $Browser) { return (New-EffectiveVersion $Browser 'Chrome browser (driver not found)') }
+        }
+        'Browser' {
+            if ($null -ne $Browser) { return (New-EffectiveVersion $Browser 'Chrome browser') }
+            if ($null -ne $Driver)  { return (New-EffectiveVersion $Driver  'installed ChromeDriver (browser not found)') }
+        }
+        'Newer' {
+            if (($null -ne $Driver) -and ($null -ne $Browser)) {
+                if ((Compare-PinVersion $Driver.Version $Browser.Version) -ge 0) {
+                    return (New-EffectiveVersion $Driver 'newer of driver/browser (ChromeDriver)')
+                }
+                return (New-EffectiveVersion $Browser 'newer of driver/browser (Chrome browser)')
+            }
+            if ($null -ne $Browser) { return (New-EffectiveVersion $Browser 'Chrome browser') }
+            if ($null -ne $Driver)  { return (New-EffectiveVersion $Driver  'installed ChromeDriver') }
+        }
+        default {
+            # Auto: the browser version is the driver version you actually need.
+            if ($null -ne $Browser) { return (New-EffectiveVersion $Browser 'Chrome browser (the driver version you need)') }
+            if ($null -ne $Driver)  { return (New-EffectiveVersion $Driver  'installed ChromeDriver') }
+        }
+    }
     return $null
 }
 
@@ -574,34 +627,76 @@ function Invoke-Main {
         return 1
     }
 
-    # --- Step 1: detect installed version ---------------------------------
-    $detection = $null
-    try {
-        $detection = Get-InstalledDriverVersion -ExplicitVersion $Version -ExplicitBinary $ChromeDriver
-    } catch {
-        [Console]::Error.WriteLine("error: " + $_.Exception.Message)
-        return 1
-    }
-
-    if ($null -eq $detection) {
-        [Console]::Error.WriteLine(@"
-error: could not detect an installed ChromeDriver version.
-       No chromedriver.exe was found on PATH or in the well-known locations,
-       and no Chrome/Chromium fallback (file or registry) was available.
-       Re-run with -Version <x.y.z.w> to supply it manually,
-       or with -ChromeDriver <path> to point at the binary.
-"@)
-        return 1
-    }
+    # --- Step 1: detect installed version(s) ------------------------------
+    $detection = $null   # the effective version that drives the pin update
+    $driver = $null      # ChromeDriver binary detection (may be $null)
+    $browser = $null     # Chrome browser detection (may be $null)
 
     Write-Rule '='
     Write-Host 'ChromeDriver pin sync  (offline / no network)'
     Write-Rule '='
-    Write-Host ("Installed ChromeDriver : " + (Format-VersionArray $detection.Version))
-    Write-Host ("  detected from        : " + $detection.Source)
-    if ($detection.Raw -and ($detection.Raw -ne (Format-VersionArray $detection.Version))) {
-        Write-Host ("  raw version string   : " + $detection.Raw)
+
+    if (-not [string]::IsNullOrWhiteSpace($Version)) {
+        # Explicit override wins and skips all detection.
+        $v = ConvertTo-VersionArray $Version
+        if ($null -eq $v) {
+            [Console]::Error.WriteLine("error: -Version '$Version' is not a valid dotted version (expected e.g. 128.0.6613.119)")
+            return 1
+        }
+        $detection = [pscustomobject]@{ Version = $v; Source = 'provided via -Version'; Raw = $Version }
+        Write-Host ("Sync version (explicit): " + (Format-VersionArray $detection.Version))
+    } else {
+        try {
+            $driver = Get-ChromeDriverVersion -ExplicitBinary $ChromeDriver
+        } catch {
+            [Console]::Error.WriteLine("error: " + $_.Exception.Message)
+            return 1
+        }
+        $browser = Get-ChromeBrowserVersion
+
+        if ($null -ne $driver) {
+            Write-Host ("Installed ChromeDriver : " + (Format-VersionArray $driver.Version))
+            Write-Host ("  detected from        : " + $driver.Source)
+            if ($driver.Raw -and ($driver.Raw -ne (Format-VersionArray $driver.Version))) {
+                Write-Host ("  raw version string   : " + $driver.Raw)
+            }
+        } else {
+            Write-Host 'Installed ChromeDriver : (not found)'
+        }
+        if ($null -ne $browser) {
+            Write-Host ("Installed Chrome       : " + (Format-VersionArray $browser.Version))
+            Write-Host ("  detected from        : " + $browser.Source)
+        } else {
+            Write-Host 'Installed Chrome       : (not found)'
+        }
+
+        # Warn on driver/browser MAJOR mismatch -- the exact cause of Selenium's
+        # SessionNotCreatedException ("only supports Chrome version N").
+        if (($null -ne $driver) -and ($null -ne $browser) -and ($driver.Version[0] -ne $browser.Version[0])) {
+            Write-Host ''
+            Write-Host ("WARNING: ChromeDriver major (" + $driver.Version[0] + ") != Chrome major (" +
+                $browser.Version[0] + ").") -ForegroundColor Yellow
+            Write-Host "         Selenium will fail with SessionNotCreatedException until the driver is" -ForegroundColor Yellow
+            Write-Host ("         replaced with a ChromeDriver " + $browser.Version[0] +
+                " build (see chromedriver_autoinstall.ps1).") -ForegroundColor Yellow
+        }
+
+        $detection = Select-EffectiveVersion -Driver $driver -Browser $browser -Mode $Source
     }
+
+    if ($null -eq $detection) {
+        [Console]::Error.WriteLine(@"
+error: could not determine a version to sync.
+       No ChromeDriver binary and no Chrome/Chromium browser were found.
+       Re-run with -Version <x.y.z.w> to supply it manually,
+       or with -ChromeDriver <path> to point at the driver binary.
+"@)
+        return 1
+    }
+
+    Write-Host ''
+    Write-Host ("Syncing repo pins to   : " + (Format-VersionArray $detection.Version) +
+        "  (source: " + $detection.Source + ")")
     Write-Host ("Repository scanned     : " + $repoRoot)
     Write-Host ''
 
