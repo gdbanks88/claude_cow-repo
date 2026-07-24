@@ -110,28 +110,17 @@ P/Invoke, not `Invoke-WebRequest`.
 
 # Install somewhere else.
 .\chromedriver_autoinstall.ps1 -Destination C:\Selenium\chromedriver.exe
-
-# Force a specific driver version (still downloads).
-.\chromedriver_autoinstall.ps1 -DriverVersion 150.0.7871.120
-
-# Egress blocked? Download chromedriver-win64.zip on a reachable box from
-# https://googlechromelabs.github.io/chrome-for-testing/ and sideload it —
-# fully offline:
-.\chromedriver_autoinstall.ps1 -ZipPath D:\stage\chromedriver-win64.zip
 ```
 
 ### Parameters
 
 | Parameter | Meaning |
 |-----------|---------|
-| `-Destination`, `-d` | Install path. Default `C:\WebDriver\chromedriver.exe`. |
-| `-ChromePath` | Explicit `chrome.exe`. Default: auto-detect (paths + registry). |
-| `-DriverVersion`, `-V` | Force a driver version and skip the CfT lookup. |
-| `-Platform` | `win64` *(default)* or `win32`. |
-| `-ZipPath` | Install from a pre-downloaded zip; no network. |
+| `-Destination` | Install path. Default `C:\WebDriver\chromedriver.exe`. |
+| `-ChromePath` | Explicit `chrome.exe`, if it isn't in a standard location. |
 
-Exit codes: `0` success, `1` error. It stops any running `chromedriver` process
-before replacing the binary and verifies with `chromedriver --version` after.
+Exit: `0` on success, non-zero on error. It stops any running `chromedriver`
+process before replacing the binary and verifies with `chromedriver --version`.
 
 ---
 
@@ -150,4 +139,4 @@ before replacing the binary and verifies with `chromedriver --version` after.
 
 - Windows Server 2022 / Windows 10/11, Windows PowerShell 5.1+ — no modules.
 - `chromedriver_autoinstall.ps1` needs outbound HTTPS to
-  `googlechromelabs.github.io` and `storage.googleapis.com` (or use `-ZipPath`).
+  `googlechromelabs.github.io` and `storage.googleapis.com`.
